@@ -232,7 +232,10 @@ impl App {
         }
     }
 
-    pub fn check_timers(&mut self) {
+    /// Returns true if any timer fired and state may have changed.
+    pub fn check_timers(&mut self) -> bool {
+        #[allow(unused_mut)]
+        let mut changed = false;
         if let Some(instant) = self.save_after {
             if instant <= Instant::now() {
                 self.save_after = None;
@@ -251,6 +254,7 @@ impl App {
                                 self.popup = Some(Popup::Alert {
                                     message: "Safari sync requires Full Disk Access.\n\n1. Press Enter to open System Settings\n2. Add your terminal app to Full Disk Access\n3. Restart epanel and re-enable Safari Sync.".to_string(),
                                 });
+                                changed = true;
                             }
                         } else {
                             self.safari_permission_warned = false;
@@ -260,11 +264,27 @@ impl App {
                                     self.last_safari_writeback = Some(modified);
                                 }
                             }
+                            changed = true;
                         }
                     }
                 }
             }
         }
+        changed
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        #[allow(unused_mut)]
+        let mut deadline: Option<Instant> = self.save_after;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(d) = self.safari_writeback_after {
+                if deadline.map(|current| d < current).unwrap_or(true) {
+                    deadline = Some(d);
+                }
+            }
+        }
+        deadline
     }
 
     fn default_config_dir() -> PathBuf {

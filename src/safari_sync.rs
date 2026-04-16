@@ -3,16 +3,19 @@
 //! Watches Safari's Bookmarks.plist and bidirectionally syncs
 //! bookmarks and reading list with epanel's folder structure.
 //!
+//! Uses a kernel-level kqueue/EVFILT_VNODE watcher (similar to Swift
+//! DispatchSourceFileSystemObject) for zero-CPU idle monitoring,
+//! plus a cheap modification-date gate before parsing.
+//!
 //! Author: Al Biheiri <al@forgottheaddress.com>
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
-use notify::{Event, RecursiveMode, Watcher};
 use plist::Value;
 use uuid::Uuid;
 
@@ -22,7 +25,17 @@ use crate::app::{Entry, Folder};
 pub struct SafariSyncManager {
     #[allow(dead_code)]
     path: PathBuf,
-    _watcher: notify::RecommendedWatcher,
+    exit_pipe_write: RawFd,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl Drop for SafariSyncManager {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::write(self.exit_pipe_write, [0u8].as_ptr() as *const libc::c_void, 1);
+            libc::close(self.exit_pipe_write);
+        }
+    }
 }
 
 impl SafariSyncManager {
@@ -31,49 +44,144 @@ impl SafariSyncManager {
         on_change: impl Fn() + Send + 'static,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let (tx, rx) = mpsc::channel::<()>();
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                match event.kind {
-                    notify::EventKind::Modify(_) | notify::EventKind::Remove(_) => {
-                        let _ = tx.send(());
-                    }
-                    _ => {}
-                }
-            }
-        })?;
+        let mut pipes = [0i32; 2];
+        if unsafe { libc::pipe(pipes.as_mut_ptr()) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let pipe_read = pipes[0];
+        let pipe_write = pipes[1];
 
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
-
-        let watch_path = path.clone();
-        std::thread::spawn(move || {
+        let thread_path = path.clone();
+        let thread = std::thread::spawn(move || {
             let mut last_modified: Option<std::time::SystemTime> = None;
-            loop {
-                match rx.recv_timeout(Duration::from_secs(30)) {
-                    Ok(()) => {
-                        std::thread::sleep(Duration::from_millis(500));
+
+            'outer: loop {
+                let fd = match open_evtonly(&thread_path) {
+                    Some(f) => f,
+                    None => {
+                        std::thread::sleep(Duration::from_secs(30));
+                        continue;
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+
+                let kq = unsafe { libc::kqueue() };
+                if kq < 0 {
+                    unsafe { libc::close(fd) };
+                    std::thread::sleep(Duration::from_secs(30));
+                    continue;
                 }
 
-                if let Ok(meta) = fs::metadata(&watch_path) {
-                    if let Ok(modified) = meta.modified() {
-                        if last_modified == Some(modified) {
+                let mut changes: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+
+                // Watch the specific file for write/rename/delete/attrib
+                changes[0].ident = fd as usize;
+                changes[0].filter = libc::EVFILT_VNODE;
+                changes[0].flags = libc::EV_ADD | libc::EV_CLEAR;
+                changes[0].fflags = (libc::NOTE_WRITE
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB) as u32;
+
+                // Watch the exit pipe so we can wake the thread for clean shutdown
+                changes[1].ident = pipe_read as usize;
+                changes[1].filter = libc::EVFILT_READ;
+                changes[1].flags = libc::EV_ADD;
+
+                let res = unsafe {
+                    libc::kevent(kq, changes.as_ptr(), 2, std::ptr::null_mut(), 0, std::ptr::null())
+                };
+                if res < 0 {
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::close(kq) };
+                    std::thread::sleep(Duration::from_secs(30));
+                    continue;
+                }
+
+                loop {
+                    let mut events: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+                    let nev = unsafe {
+                        libc::kevent(
+                            kq,
+                            std::ptr::null(),
+                            0,
+                            events.as_mut_ptr(),
+                            2,
+                            std::ptr::null(),
+                        )
+                    };
+
+                    if nev < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
                             continue;
                         }
-                        last_modified = Some(modified);
-                        on_change();
+                        break;
                     }
+
+                    let mut file_changed = false;
+                    let mut should_exit = false;
+                    let mut reestablish = false;
+
+                    for i in 0..nev as usize {
+                        let ev = &events[i];
+                        if ev.ident == pipe_read as usize {
+                            should_exit = true;
+                        } else if ev.ident == fd as usize {
+                            file_changed = true;
+                            if (ev.fflags as u32)
+                                & (libc::NOTE_DELETE | libc::NOTE_RENAME) as u32
+                                != 0
+                            {
+                                reestablish = true;
+                            }
+                        }
+                    }
+
+                    unsafe { libc::close(fd) };
+                    unsafe { libc::close(kq) };
+
+                    if should_exit {
+                        unsafe { libc::close(pipe_read) };
+                        return;
+                    }
+
+                    if file_changed {
+                        if let Ok(meta) = fs::metadata(&thread_path) {
+                            if let Ok(modified) = meta.modified() {
+                                if last_modified != Some(modified) {
+                                    last_modified = Some(modified);
+                                    on_change();
+                                }
+                            }
+                        }
+                    }
+
+                    if reestablish {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+
+                    continue 'outer;
                 }
             }
         });
 
         Ok(Self {
             path,
-            _watcher: watcher,
+            exit_pipe_write: pipe_write,
+            _thread: thread,
         })
+    }
+}
+
+fn open_evtonly(path: &Path) -> Option<RawFd> {
+    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_EVTONLY) };
+    if fd < 0 {
+        None
+    } else {
+        Some(fd)
     }
 }
 

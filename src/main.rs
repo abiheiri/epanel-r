@@ -5,7 +5,6 @@
 //! Author: Al Biheiri <al@forgottheaddress.com>
 
 use std::io;
-use std::time::Duration;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -109,10 +108,45 @@ fn run_app(
     app: &mut App,
     #[allow(unused_variables)] sync_rx: std::sync::mpsc::Receiver<(Vec<app::Folder>, app::Folder)>,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+    terminal.draw(|f| ui::draw(f, app))?;
 
-        app.check_timers();
+    loop {
+        let timeout = match app.next_timer_deadline() {
+            Some(deadline) => {
+                let now = std::time::Instant::now();
+                if deadline <= now {
+                    std::time::Duration::from_millis(0)
+                } else {
+                    // Cap at 200 ms so background Safari sync events are processed promptly.
+                    // crossterm's event::poll only watches stdin, so we can't be woken by
+                    // the sync channel; putting a short periodic poll keeps CPU near zero while
+                    // remaining responsive.
+                    (deadline - now).min(std::time::Duration::from_millis(200))
+                }
+            }
+            None => std::time::Duration::from_millis(200),
+        };
+
+        let mut changed = false;
+
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        if app.handle_key(key.code, key.modifiers) {
+                            return Ok(());
+                        }
+                        changed = true;
+                    }
+                }
+                Event::Resize(_, _) => changed = true,
+                _ => {}
+            }
+        }
+
+        if app.check_timers() {
+            changed = true;
+        }
 
         #[cfg(target_os = "macos")]
         if app.popup.is_none() {
@@ -126,6 +160,7 @@ fn run_app(
                     .unwrap_or(true);
                 if should_apply {
                     app.apply_safari_sync(folders, reading_list);
+                    changed = true;
                 }
             }
         } else {
@@ -133,14 +168,8 @@ fn run_app(
             while let Ok(_) = sync_rx.try_recv() {}
         }
 
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if app.handle_key(key.code, key.modifiers) {
-                        return Ok(());
-                    }
-                }
-            }
+        if changed {
+            terminal.draw(|f| ui::draw(f, app))?;
         }
     }
 }
