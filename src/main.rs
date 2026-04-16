@@ -19,6 +19,8 @@ use ratatui::{
 };
 
 mod app;
+// Safari sync is only available on macOS.
+// Keeping it out of the build on other OS
 #[cfg(target_os = "macos")]
 mod safari_sync;
 mod ui;
@@ -37,7 +39,6 @@ struct Cli {
     #[arg(long)]
     update: bool,
 
-    /// Show author and website information
     #[arg(long)]
     about: bool,
 }
@@ -151,7 +152,7 @@ fn run_app(
         #[cfg(target_os = "macos")]
         if app.popup.is_none() {
             if let Ok((folders, reading_list)) = sync_rx.try_recv() {
-                let should_apply = std::fs::metadata(&app.safari_sync_path)
+                let should_apply = std::fs::metadata(app::expand_tilde(&app.safari_sync_path))
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .map(|modified| {
@@ -174,6 +175,7 @@ fn run_app(
     }
 }
 
+// Check GitHub for the latest release and update if a newer version is available.
 fn update() -> Result<()> {
     let repo_url = env!("CARGO_PKG_REPOSITORY");
     let parts: Vec<&str> = repo_url.trim_end_matches('/').split('/').collect();

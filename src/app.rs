@@ -91,6 +91,22 @@ impl EPanelData {
     }
 }
 
+/// Rusts 'fs' functions does not expand '~' to the users home dir;
+/// this helper makes sure paths typed in the TUI settings resolve.
+pub(crate) fn expand_tilde(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if let Some(comp) = path.components().next() {
+        if let std::path::Component::Normal(os) = comp {
+            if os == "~" {
+                if let Some(home) = dirs::home_dir() {
+                    return home.join(path.strip_prefix("~").unwrap_or(path));
+                }
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
@@ -247,7 +263,7 @@ impl App {
             if let Some(instant) = self.safari_writeback_after {
                 if instant <= Instant::now() {
                     self.safari_writeback_after = None;
-                    if self.safari_sync_enabled && Path::new(&self.safari_sync_path).exists() {
+                    if self.safari_sync_enabled && expand_tilde(&self.safari_sync_path).exists() {
                         if let Err(_) = self.writeback_safari() {
                             if !self.safari_permission_warned {
                                 self.safari_permission_warned = true;
@@ -259,7 +275,7 @@ impl App {
                         } else {
                             self.safari_permission_warned = false;
                             self.message = Some("Synced to Safari".to_string());
-                            if let Ok(meta) = fs::metadata(&self.safari_sync_path) {
+                            if let Ok(meta) = fs::metadata(expand_tilde(&self.safari_sync_path)) {
                                 if let Ok(modified) = meta.modified() {
                                     self.last_safari_writeback = Some(modified);
                                 }
@@ -298,15 +314,15 @@ impl App {
     }
 
     fn data_file_path(&self) -> PathBuf {
-        Path::new(&self.settings_links_path).join("epanel.json")
+        expand_tilde(&self.settings_links_path).join("epanel.json")
     }
 
     fn notes_file_path(&self) -> PathBuf {
-        Path::new(&self.settings_notes_path).join("notes.txt")
+        expand_tilde(&self.settings_notes_path).join("notes.txt")
     }
 
     // -----------------------------------------------------------------------
-    // Persistence
+    // Load / save settings and JSON data
     // -----------------------------------------------------------------------
 
     pub fn load(&mut self) -> Result<()> {
@@ -328,25 +344,11 @@ impl App {
             }
         }
 
-        // Migrate legacy file paths to directory paths
-        if Path::new(&self.settings_links_path).is_file() {
-            self.settings_links_path = Path::new(&self.settings_links_path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.config_dir.to_string_lossy().into_owned());
-        }
-        if Path::new(&self.settings_notes_path).is_file() {
-            self.settings_notes_path = Path::new(&self.settings_notes_path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.config_dir.to_string_lossy().into_owned());
-        }
-
-        // Heal broken paths that point to deleted temp dirs
-        if !Path::new(&self.settings_links_path).exists() {
+        // If the directory you previously saved for links or notes no longer exists; fallback to the default config directory
+        if !expand_tilde(&self.settings_links_path).exists() {
             self.settings_links_path = self.config_dir.to_string_lossy().into_owned();
         }
-        if !Path::new(&self.settings_notes_path).exists() {
+        if !expand_tilde(&self.settings_notes_path).exists() {
             self.settings_notes_path = self.config_dir.to_string_lossy().into_owned();
         }
 
@@ -356,30 +358,6 @@ impl App {
             self.data = serde_json::from_str(&content)?;
             self.ensure_valid_root();
             self.notes_text = self.data.notes.clone();
-        } else {
-            // Legacy migration
-            let legacy_links = Path::new(&self.settings_links_path).join("links.txt");
-            let legacy_notes = Path::new(&self.settings_notes_path).join("notes.txt");
-            let mut migrated = false;
-            if fs::metadata(&legacy_links).is_ok() {
-                let content = fs::read_to_string(&legacy_links)?;
-                for line in content.lines() {
-                    let text = line.trim();
-                    if !text.is_empty() {
-                        self.data.root_folder.entries.push(Entry::new(text.to_string()));
-                    }
-                }
-                migrated = true;
-            }
-            if fs::metadata(&legacy_notes).is_ok() {
-                let notes = fs::read_to_string(&legacy_notes)?;
-                self.data.notes = notes;
-                self.notes_text = self.data.notes.clone();
-                migrated = true;
-            }
-            if migrated {
-                let _ = self.save();
-            }
         }
 
         self.rebuild_flat_items();
@@ -395,8 +373,8 @@ impl App {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        fs::create_dir_all(&self.settings_links_path)?;
-        fs::create_dir_all(&self.settings_notes_path)?;
+        fs::create_dir_all(expand_tilde(&self.settings_links_path))?;
+        fs::create_dir_all(expand_tilde(&self.settings_notes_path))?;
         fs::create_dir_all(&self.config_dir)?;
 
         self.data.notes = self.notes_text.clone();
@@ -415,10 +393,10 @@ impl App {
         {
             settings.push_str(&format!("safari_sync={}\n", self.safari_sync_enabled));
             settings.push_str(&format!("safari_sync_path={}\n", self.safari_sync_path));
-            if self.safari_sync_enabled && Path::new(&self.safari_sync_path).exists() {
+            if self.safari_sync_enabled && expand_tilde(&self.safari_sync_path).exists() {
                 if self.writeback_safari().is_ok() {
                     self.safari_permission_warned = false;
-                    if let Ok(meta) = fs::metadata(&self.safari_sync_path) {
+                    if let Ok(meta) = fs::metadata(expand_tilde(&self.safari_sync_path)) {
                         if let Ok(modified) = meta.modified() {
                             self.last_safari_writeback = Some(modified);
                         }
@@ -433,11 +411,11 @@ impl App {
 
     #[cfg(target_os = "macos")]
     fn writeback_safari(&mut self) -> Result<()> {
-        crate::safari_sync::writeback_safari_plist(&self.safari_sync_path, &self.data.root_folder)
+        crate::safari_sync::writeback_safari_plist(expand_tilde(&self.safari_sync_path), &self.data.root_folder)
     }
 
     // -----------------------------------------------------------------------
-    // Input handling
+    // Keyboard Input handling
     // -----------------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -712,7 +690,7 @@ impl App {
         match self.import_safari() {
             Ok((folders, reading_list)) => {
                 self.apply_safari_sync(folders, reading_list);
-                if let Ok(meta) = fs::metadata(&self.safari_sync_path) {
+                if let Ok(meta) = fs::metadata(expand_tilde(&self.safari_sync_path)) {
                     if let Ok(modified) = meta.modified() {
                         self.last_safari_writeback = Some(modified);
                     }
@@ -727,7 +705,7 @@ impl App {
     #[cfg(target_os = "macos")]
     pub fn start_safari_sync(&mut self) {
         if let Some(ref tx) = self.sync_tx {
-            let path = self.safari_sync_path.clone();
+            let path = expand_tilde(&self.safari_sync_path);
             let path_clone = path.clone();
             let tx = tx.clone();
             if let Ok(manager) = crate::safari_sync::SafariSyncManager::new(&path, move || {
@@ -742,14 +720,14 @@ impl App {
 
     #[cfg(target_os = "macos")]
     fn import_safari(&self) -> Result<(Vec<Folder>, Folder), String> {
-        let path = Path::new(&self.safari_sync_path);
+        let path = expand_tilde(&self.safari_sync_path);
         if !path.exists() {
             return Err(format!(
                 "Safari bookmarks file not found at:\n{}\n\nOn newer macOS versions the file may be in a different location (e.g. ~/Library/Containers/com.apple.Safari/Data/Library/Safari/Bookmarks.plist).",
                 self.safari_sync_path
             ));
         }
-        match fs::read(path) {
+        match fs::read(&path) {
             Err(e) => {
                 let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
                     "\n\nThis usually means Full Disk Access is required.\n1. Quit your terminal app completely\n2. Add it to System Settings > Privacy & Security > Full Disk Access\n3. Restart the terminal and epanel"
@@ -759,7 +737,7 @@ impl App {
                 Err(format!("Cannot read Safari bookmarks: {}{}", e, hint))
             }
             Ok(_) => {
-                crate::safari_sync::parse_safari_plist(&self.safari_sync_path)
+                crate::safari_sync::parse_safari_plist(&path)
             }
         }
     }
@@ -1055,7 +1033,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Tree helpers
+    // Tree structure helpers
     // -----------------------------------------------------------------------
 
     pub fn rebuild_flat_items(&mut self) {
@@ -1159,7 +1137,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Data mutation helpers
+    // Data modification helpers
     // -----------------------------------------------------------------------
 
     fn modify_folder(&mut self, id: Uuid, mut modifier: impl FnMut(&mut Folder)) {
