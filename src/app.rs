@@ -1252,7 +1252,7 @@ impl App {
         if folder_id == to_parent_id {
             return;
         }
-        // Prevent moving into a descendant
+        // Prevent moving a folder into itself or its descendants
         if let Some(target) = self.find_folder(to_parent_id) {
             fn is_descendant(folder: &Folder, ancestor_id: Uuid) -> bool {
                 if folder.id == ancestor_id {
@@ -1470,8 +1470,12 @@ impl App {
             (
                 "About",
                 vec![
-                    ("Author", "Al Biheiri <al@forgottheaddress.com>"),
-                    ("Website", "http://www.abiheiri.com"),
+                    ("Author", env!("CARGO_PKG_AUTHORS")),
+                    (
+                        "Website",
+                        option_env!("CARGO_PKG_HOMEPAGE").unwrap_or("N/A"),
+                    ),
+                    ("Version", VERSION),
                 ],
             ),
         ]
