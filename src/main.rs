@@ -5,6 +5,7 @@
 //! Author: Al Biheiri <al@forgottheaddress.com>
 
 use std::io;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -19,6 +20,8 @@ use ratatui::{
 };
 
 mod app;
+#[cfg(target_os = "macos")]
+mod safari_sync;
 mod ui;
 
 use app::App;
@@ -34,6 +37,10 @@ struct Cli {
     /// Update to the latest release
     #[arg(long)]
     update: bool,
+
+    /// Show author and website information
+    #[arg(long)]
+    about: bool,
 }
 
 fn main() -> Result<()> {
@@ -50,6 +57,12 @@ fn main() -> Result<()> {
         return update();
     }
 
+    if cli.about {
+        println!("Author: Al Biheiri <al@forgottheaddress.com>");
+        println!("Website: http://www.abiheiri.com");
+        return Ok(());
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -59,7 +72,24 @@ fn main() -> Result<()> {
     let mut app = App::new();
     app.load()?;
 
-    let res = run_app(&mut terminal, &mut app);
+    #[cfg(target_os = "macos")]
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<(Vec<app::Folder>, app::Folder)>();
+    #[cfg(target_os = "macos")]
+    {
+        app.sync_tx = Some(sync_tx.clone());
+        if app.safari_sync_enabled {
+            app.sync_safari_on_startup();
+            app.start_safari_sync();
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let sync_rx: std::sync::mpsc::Receiver<(Vec<app::Folder>, app::Folder)> = {
+        let (_, rx) = std::sync::mpsc::channel();
+        rx
+    };
+
+    let res = run_app(&mut terminal, &mut app, sync_rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -74,14 +104,41 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    #[allow(unused_variables)] sync_rx: std::sync::mpsc::Receiver<(Vec<app::Folder>, app::Folder)>,
+) -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                if app.handle_key(key.code, key.modifiers) {
-                    return Ok(());
+        app.check_timers();
+
+        #[cfg(target_os = "macos")]
+        if app.popup.is_none() {
+            if let Ok((folders, reading_list)) = sync_rx.try_recv() {
+                let should_apply = std::fs::metadata(&app.safari_sync_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|modified| {
+                        app.last_safari_writeback.map(|last| modified > last).unwrap_or(true)
+                    })
+                    .unwrap_or(true);
+                if should_apply {
+                    app.apply_safari_sync(folders, reading_list);
+                }
+            }
+        } else {
+            // Drain sync updates while a popup is open to avoid backlog
+            while let Ok(_) = sync_rx.try_recv() {}
+        }
+
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    if app.handle_key(key.code, key.modifiers) {
+                        return Ok(());
+                    }
                 }
             }
         }
