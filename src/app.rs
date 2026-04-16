@@ -12,7 +12,7 @@ use crossterm::event::KeyCode;
 
 pub const VERSION: &str = match option_env!("EPANEL_VERSION") {
     Some(v) => v,
-    None => "v0.1.0",
+    None => "v0.0.1",
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
