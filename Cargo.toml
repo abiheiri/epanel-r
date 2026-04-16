@@ -1,0 +1,16 @@
+[package]
+name = "epanel"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/abiheiri/epanel-r"
+
+[dependencies]
+anyhow = "1.0.102"
+crossterm = "0.29.0"
+flate2 = "1.1.9"
+ratatui = "0.30.0"
+serde_json = "1.0.149"
+tar = "0.4.45"
+ureq = "3.3.0"
+dirs = "6.0"
+clap = { version = "4", features = ["derive"] }
