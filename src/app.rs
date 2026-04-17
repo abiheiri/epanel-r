@@ -190,6 +190,7 @@ pub struct App {
     pub message: Option<String>,
     pub config_dir: PathBuf,
     pub save_after: Option<Instant>,
+    pub last_save_time: Option<Instant>,
     #[cfg(target_os = "macos")]
     pub safari_writeback_after: Option<Instant>,
 }
@@ -235,6 +236,7 @@ impl App {
             message: None,
             config_dir: config_dir.clone(),
             save_after: None,
+            last_save_time: None,
             #[cfg(target_os = "macos")]
             safari_writeback_after: None,
         }
@@ -313,7 +315,7 @@ impl App {
         self.config_dir.join("settings.txt")
     }
 
-    fn data_file_path(&self) -> PathBuf {
+    pub fn data_file_path(&self) -> PathBuf {
         expand_tilde(&self.settings_links_path).join("epanel.json")
     }
 
@@ -379,7 +381,11 @@ impl App {
 
         self.data.notes = self.notes_text.clone();
         let json = serde_json::to_string_pretty(&self.data)?;
-        fs::write(self.data_file_path(), json)?;
+        let path = self.data_file_path();
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(tmp, path)?;
+        self.last_save_time = Some(Instant::now());
 
         // Keep a plain-text notes mirror for convenience
         fs::write(self.notes_file_path(), &self.notes_text)?;
@@ -406,6 +412,54 @@ impl App {
         }
         fs::write(self.settings_file_path(), settings)?;
 
+        Ok(())
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        let path = self.data_file_path();
+        if !path.exists() {
+            self.message = Some("Data file missing".to_string());
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let new_data: EPanelData = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(e) => {
+                self.popup = Some(Popup::Alert {
+                    message: format!("Reload failed: invalid JSON ({})", e),
+                });
+                return Ok(());
+            }
+        };
+
+        // Cancel any pending save — external data is now canonical
+        self.save_after = None;
+
+        // Preserve cursor and selection by ID
+        let old_cursor_id = self.links_cursor.and_then(|idx| self.flat_items.get(idx).map(|item| item.id));
+        let old_selected: HashSet<Uuid> = self.selected_item_ids.clone();
+
+        self.data = new_data;
+        self.ensure_valid_root();
+        self.notes_text = self.data.notes.clone();
+
+        self.rebuild_flat_items();
+
+        // Restore cursor by ID if possible
+        if let Some(id) = old_cursor_id {
+            if let Some(idx) = self.flat_items.iter().position(|item| item.id == id) {
+                self.links_cursor = Some(idx);
+            }
+        }
+
+        // Restore selection by ID
+        self.selected_item_ids = old_selected
+            .into_iter()
+            .filter(|id| self.flat_items.iter().any(|item| item.id == *id))
+            .collect();
+
+        self.message = Some("Reloaded from disk".to_string());
         Ok(())
     }
 
@@ -1634,5 +1688,49 @@ mod tests {
         assert!(app.data.root_folder.entries.is_empty());
         assert_eq!(app.data.root_folder.subfolders[0].entries.len(), 1);
         assert_eq!(app.data.root_folder.subfolders[0].entries[0].text, "link1");
+    }
+
+    #[test]
+    fn reload_preserves_state() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("config");
+
+        let mut app = App::new();
+        app.config_dir = cfg.clone();
+        app.settings_links_path = dir.path().join("links").to_string_lossy().into_owned();
+        app.settings_notes_path = dir.path().join("notes").to_string_lossy().into_owned();
+
+        // Set up initial data
+        let entry = Entry::new("https://old.com".to_string());
+        let entry_id = entry.id;
+        app.data.root_folder.entries.push(entry);
+        app.data.notes = "Old notes".to_string();
+        app.notes_text = app.data.notes.clone();
+        app.rebuild_flat_items();
+        app.links_cursor = Some(0);
+        app.selected_item_ids.insert(entry_id);
+        app.save().unwrap();
+
+        // Simulate external edit by rewriting epanel.json directly
+        let data_path = dir.path().join("links/epanel.json");
+        let mut external_data = app.data.clone();
+        external_data.root_folder.entries[0].text = "https://new.com".to_string();
+        external_data.notes = "New notes".to_string();
+        std::fs::write(&data_path, serde_json::to_string_pretty(&external_data).unwrap()).unwrap();
+
+        // Reload
+        app.reload().unwrap();
+
+        // Data should reflect external changes
+        assert_eq!(app.data.root_folder.entries[0].text, "https://new.com");
+        assert_eq!(app.data.notes, "New notes");
+        assert_eq!(app.notes_text, "New notes");
+
+        // Cursor and selection should be preserved by ID
+        assert_eq!(app.links_cursor, Some(0));
+        assert!(app.selected_item_ids.contains(&entry_id));
+
+        // Message should indicate reload
+        assert_eq!(app.message, Some("Reloaded from disk".to_string()));
     }
 }

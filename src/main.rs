@@ -13,6 +13,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     backend::CrosstermBackend,
     Terminal,
@@ -89,7 +90,25 @@ fn main() -> Result<()> {
         rx
     };
 
-    let res = run_app(&mut terminal, &mut app, sync_rx);
+    // Set up file watcher for external changes (e.g. Syncthing)
+    let data_dir = app.data_file_path().parent().unwrap_or(&app.config_dir).to_path_buf();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let (watch_tx, watch_rx) = std::sync::mpsc::channel::<notify::Event>();
+    let _watcher = {
+        let tx = watch_tx;
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = tx.send(event);
+                }
+            },
+            Config::default(),
+        )?;
+        watcher.watch(&data_dir, RecursiveMode::NonRecursive)?;
+        watcher
+    };
+
+    let res = run_app(&mut terminal, &mut app, sync_rx, watch_rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -108,6 +127,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     #[allow(unused_variables)] sync_rx: std::sync::mpsc::Receiver<(Vec<app::Folder>, app::Folder)>,
+    watch_rx: std::sync::mpsc::Receiver<notify::Event>,
 ) -> Result<()> {
     terminal.draw(|f| ui::draw(f, app))?;
 
@@ -167,6 +187,36 @@ fn run_app(
         } else {
             // Drain sync updates while a popup is open to avoid backlog
             while let Ok(_) = sync_rx.try_recv() {}
+        }
+
+        // Check file watcher for external changes
+        while let Ok(event) = watch_rx.try_recv() {
+            let relevant = matches!(
+                event.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+            );
+            if !relevant {
+                continue;
+            }
+            // Ignore temp files created by our atomic write
+            let is_tmp = event.paths.iter().any(|p| {
+                p.extension() == Some(std::ffi::OsStr::new("tmp"))
+            });
+            if is_tmp {
+                continue;
+            }
+            // Ignore events triggered by our own save (within 500 ms)
+            if let Some(last_save) = app.last_save_time {
+                if last_save.elapsed() < std::time::Duration::from_millis(500) {
+                    continue;
+                }
+            }
+            if let Err(e) = app.reload() {
+                app.popup = Some(app::Popup::Alert {
+                    message: format!("Reload failed: {}", e),
+                });
+            }
+            changed = true;
         }
 
         if changed {

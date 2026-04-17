@@ -1,6 +1,6 @@
 [package]
 name = "epanel"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["Al Biheiri <al@forgottheaddress.com>"]
 homepage = "http://www.abiheiri.com"
@@ -19,6 +19,7 @@ serde_json = "1.0.149"
 tar = "0.4.45"
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 ureq = "3.3.0"
+notify = "7.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
